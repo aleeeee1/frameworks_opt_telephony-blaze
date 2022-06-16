@@ -817,6 +817,7 @@ public class MultiSimSettingController extends Handler {
                 mSubController.getGroupUuid(subId), mContext.getOpPackageName(),
                 mContext.getAttributionTag());
 
+        if (mPrimarySubList.size() != 1)
                 // add a sysprop to notify device on data switch
                 SystemProperties.set("persist.sys.radio.mobile_data_swap", "1");
 
