@@ -87,6 +87,7 @@ import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.PhoneFactory;
 import com.android.internal.telephony.RIL;
+import com.android.internal.telephony.data.DataConfigManager.DataConfigManagerCallback;
 import com.android.internal.telephony.data.DataEvaluation.DataAllowedReason;
 import com.android.internal.telephony.data.DataNetworkController.NetworkRequestList;
 import com.android.internal.telephony.data.DataRetryManager.DataHandoverRetryEntry;
@@ -189,9 +190,6 @@ public class DataNetwork extends StateMachine {
     /** Event for display info changed. This is for getting 5G NSA or mmwave information. */
     private static final int EVENT_DISPLAY_INFO_CHANGED = 13;
 
-    /** Event for initiating an handover between cellular and IWLAN. */
-    private static final int EVENT_START_HANDOVER = 14;
-
     /** Event for setup data call (for handover) response from the data service. */
     private static final int EVENT_HANDOVER_RESPONSE = 15;
 
@@ -230,6 +228,24 @@ public class DataNetwork extends StateMachine {
 
     /** Event for CSS indicator changed. */
     private static final int EVENT_CSS_INDICATOR_CHANGED = 24;
+
+    /**
+     * Event for notifying source transport that handover is about to be initiated on target
+     * transport.
+     */
+    private static final int EVENT_NOTIFY_HANDOVER_STARTED = 25;
+
+    /**
+     * Event for the response of notifying source transport that handover is about to be initiated
+     * on target transport.
+     */
+    private static final int EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE = 26;
+
+    /**
+     * Event for the response of notifying source transport that handover is cancelled/failed on the
+     * target transport.
+     */
+    private static final int EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE = 27;
 
     /** Invalid context id. */
     private static final int INVALID_CID = -1;
@@ -628,10 +644,10 @@ public class DataNetwork extends StateMachine {
     private @NonNull DataAllowedReason mDataAllowedReason;
 
     /**
-     * PCO (Protocol Configuration Options) data received from the network. Key is the PCO id, value
-     * is the PCO content.
+     * PCO (Protocol Configuration Options) data received from the network. The first key is the
+     * cid of the PCO data, the second key is the PCO id, the value is the PCO data.
      */
-    private final @NonNull Map<Integer, PcoData> mPcoData = new ArrayMap<>();
+    private final @NonNull Map<Integer, Map<Integer, PcoData>> mPcoData = new ArrayMap<>();
 
     /** The QOS bearer sessions. */
     private final @NonNull List<QosBearerSession> mQosBearerSessions = new ArrayList<>();
@@ -650,6 +666,11 @@ public class DataNetwork extends StateMachine {
      * Link bandwidth estimator callback for receiving latest link bandwidth information.
      */
     private @Nullable LinkBandwidthEstimatorCallback mLinkBandwidthEstimatorCallback;
+
+    /**
+     * Data config callback for carrier config update.
+     */
+    private @Nullable DataConfigManagerCallback mDataConfigManagerCallback;
 
     /**
      * The network bandwidth.
@@ -982,7 +1003,15 @@ public class DataNetwork extends StateMachine {
         @Override
         public void enter() {
             logv("Registering all events.");
-            mDataConfigManager.registerForConfigUpdate(getHandler(), EVENT_DATA_CONFIG_UPDATED);
+            mDataConfigManagerCallback = new DataConfigManagerCallback(getHandler()::post) {
+                @Override
+                public void onCarrierConfigChanged() {
+                    sendMessage(EVENT_DATA_CONFIG_UPDATED);
+                }
+            };
+            mRil.registerForPcoData(getHandler(), EVENT_PCO_DATA_RECEIVED, null);
+
+            mDataConfigManager.registerCallback(mDataConfigManagerCallback);
             mPhone.getDisplayInfoController().registerForTelephonyDisplayInfoChanged(
                     getHandler(), EVENT_DISPLAY_INFO_CHANGED, null);
             mPhone.getServiceStateTracker().registerForServiceStateChanged(getHandler(),
@@ -1034,14 +1063,15 @@ public class DataNetwork extends StateMachine {
             mPhone.getServiceStateTracker().unregisterForServiceStateChanged(getHandler());
             mPhone.getDisplayInfoController().unregisterForTelephonyDisplayInfoChanged(
                     getHandler());
-            mDataConfigManager.unregisterForConfigUpdate(getHandler());
+            mRil.unregisterForPcoData(getHandler());
+            mDataConfigManager.unregisterCallback(mDataConfigManagerCallback);
         }
 
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
                 case EVENT_DATA_CONFIG_UPDATED:
-                    onDataConfigUpdated();
+                    onCarrierConfigUpdated();
                     break;
                 case EVENT_SERVICE_STATE_CHANGED: {
                     mDataCallSessionStats.onDrsOrRatChanged(getDataNetworkType());
@@ -1081,9 +1111,16 @@ public class DataNetwork extends StateMachine {
                     updateNetworkCapabilities();
                     break;
                 }
+                case EVENT_PCO_DATA_RECEIVED: {
+                    AsyncResult ar = (AsyncResult) msg.obj;
+                    onPcoDataReceived((PcoData) ar.result);
+                    break;
+                }
+                case EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE:
+                    log("Notified handover cancelled.");
+                    break;
                 case EVENT_BANDWIDTH_ESTIMATE_FROM_MODEM_CHANGED:
                 case EVENT_TEAR_DOWN_NETWORK:
-                case EVENT_PCO_DATA_RECEIVED:
                 case EVENT_STUCK_IN_TRANSIENT_STATE:
                 case EVENT_DISPLAY_INFO_CHANGED:
                 case EVENT_WAITING_FOR_TEARING_DOWN_CONDITION_MET:
@@ -1093,7 +1130,8 @@ public class DataNetwork extends StateMachine {
                     // Ignore the events when not in the correct state.
                     log("Ignored " + eventToString(msg.what));
                     break;
-                case EVENT_START_HANDOVER:
+                case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
+                case EVENT_NOTIFY_HANDOVER_STARTED:
                     log("Ignore the handover to " + AccessNetworkConstants
                             .transportTypeToString(msg.arg1) + " request.");
                     break;
@@ -1160,9 +1198,8 @@ public class DataNetwork extends StateMachine {
                             msg.getData().getParcelable(DataServiceManager.DATA_CALL_RESPONSE);
                     onSetupResponse(resultCode, dataCallResponse);
                     break;
-                case EVENT_START_HANDOVER:
+                case EVENT_NOTIFY_HANDOVER_STARTED:
                 case EVENT_TEAR_DOWN_NETWORK:
-                case EVENT_PCO_DATA_RECEIVED:
                 case EVENT_WAITING_FOR_TEARING_DOWN_CONDITION_MET:
                     // Defer the request until connected or disconnected.
                     log("Defer message " + eventToString(msg.what));
@@ -1229,6 +1266,13 @@ public class DataNetwork extends StateMachine {
                 }
             }
 
+            // If we've ever received PCO data before connected, now it's the time to
+            // process it.
+            mPcoData.getOrDefault(mCid.get(mTransport), Collections.emptyMap())
+                    .forEach((pcoId, pcoData) -> {
+                        onPcoDataChanged(pcoData);
+                    });
+
             notifyPreciseDataConnectionState();
             updateSuspendState();
         }
@@ -1273,15 +1317,24 @@ public class DataNetwork extends StateMachine {
                 case EVENT_DISPLAY_INFO_CHANGED:
                     onDisplayInfoChanged();
                     break;
-                case EVENT_START_HANDOVER:
-                    onStartHandover(msg.arg1, (DataHandoverRetryEntry) msg.obj);
+                case EVENT_NOTIFY_HANDOVER_STARTED:
+                    // Notify source transport that handover is about to start. Note this will not
+                    // initiate the handover process on target transport, but more for notifying
+                    // the source transport so that PDU session id can be preserved if network
+                    // notifies PDN lost during handover. The real handover process will kick off
+                    // after receiving EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE.
+                    log("Notifying source transport "
+                            + AccessNetworkConstants.transportTypeToString(mTransport)
+                            + " that handover is about to start.");
+                    mDataServiceManagers.get(mTransport).startHandover(mCid.get(mTransport),
+                            obtainMessage(EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE, 0, msg.arg2,
+                                    msg.obj));
+                    // We enter handover state here because this is the first action we do for
+                    // handover.
+                    transitionTo(mHandoverState);
                     break;
                 case EVENT_SUBSCRIPTION_PLAN_OVERRIDE:
                     updateMeteredAndCongested();
-                    break;
-                case EVENT_PCO_DATA_RECEIVED:
-                    ar = (AsyncResult) msg.obj;
-                    onPcoDataReceived((PcoData) ar.result);
                     break;
                 case EVENT_DEACTIVATE_DATA_NETWORK_RESPONSE:
                     int resultCode = msg.arg1;
@@ -1346,6 +1399,9 @@ public class DataNetwork extends StateMachine {
                     log("Defer message " + eventToString(msg.what));
                     deferMessage(msg);
                     break;
+                case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
+                    onStartHandover(msg.arg2, (DataHandoverRetryEntry) msg.obj);
+                    break;
                 case EVENT_HANDOVER_RESPONSE:
                     int resultCode = msg.arg1;
                     DataCallResponse dataCallResponse =
@@ -1353,16 +1409,12 @@ public class DataNetwork extends StateMachine {
                     onHandoverResponse(resultCode, dataCallResponse,
                             (DataHandoverRetryEntry) msg.obj);
                     break;
-                case EVENT_PCO_DATA_RECEIVED:
-                    AsyncResult ar = (AsyncResult) msg.obj;
-                    onPcoDataReceived((PcoData) ar.result);
-                    break;
                 case EVENT_STUCK_IN_TRANSIENT_STATE:
+                    // enable detection only for valid timeout range
                     reportAnomaly("Data service did not respond the handover request within "
-                            + TimeUnit.MILLISECONDS.toSeconds(
+                                    + TimeUnit.MILLISECONDS.toSeconds(
                             mDataConfigManager.getNetworkHandoverTimeoutMs()) + " seconds.",
                             "1afe68cb-8b41-4964-a737-4f34372429ea");
-
                     // Handover failed. Use the retry logic defined in
                     // CarrierConfigManager.KEY_TELEPHONY_DATA_HANDOVER_RETRY_RULES_STRING_ARRAY.
                     long retry = DataCallResponse.RETRY_DURATION_UNDEFINED;
@@ -1456,6 +1508,7 @@ public class DataNetwork extends StateMachine {
                 case EVENT_STUCK_IN_TRANSIENT_STATE:
                     // After frameworks issues deactivate data call request, RIL should report
                     // data disconnected through data call list changed event subsequently.
+
                     reportAnomaly("RIL did not send data call list changed event after "
                             + "deactivate data call request within "
                             + TimeUnit.MILLISECONDS.toSeconds(
@@ -1545,7 +1598,6 @@ public class DataNetwork extends StateMachine {
     private void registerForWwanEvents() {
         registerForBandwidthUpdate();
         mKeepaliveTracker.registerForKeepaliveStatus();
-        mRil.registerForPcoData(this.getHandler(), EVENT_PCO_DATA_RECEIVED, null);
     }
 
     /**
@@ -1554,7 +1606,6 @@ public class DataNetwork extends StateMachine {
     private void unregisterForWwanEvents() {
         unregisterForBandwidthUpdate();
         mKeepaliveTracker.unregisterForKeepaliveStatus();
-        mRil.unregisterForPcoData(this.getHandler());
     }
 
     @Override
@@ -2555,10 +2606,10 @@ public class DataNetwork extends StateMachine {
     }
 
     /**
-     * Called when data config updated.
+     * Called when carrier config updated.
      */
-    private void onDataConfigUpdated() {
-        log("onDataConfigUpdated");
+    private void onCarrierConfigUpdated() {
+        log("onCarrierConfigUpdated");
 
         updateBandwidthFromDataConfig();
         updateTcpBufferSizes();
@@ -2963,8 +3014,6 @@ public class DataNetwork extends StateMachine {
                 && mNetworkCapabilities.hasCapability(
                         NetworkCapabilities.NET_CAPABILITY_TRUSTED)
                 && mNetworkCapabilities.hasCapability(
-                        NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED)
-                && mNetworkCapabilities.hasCapability(
                         NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
     }
 
@@ -3006,6 +3055,12 @@ public class DataNetwork extends StateMachine {
     /**
      * Request the data network to handover to the target transport.
      *
+     * This is the starting point of initiating IWLAN/cellular handover. It will first call
+     * {@link DataServiceManager#startHandover(int, Message)} to notify source transport that
+     * handover is about to start, and then call {@link DataServiceManager#setupDataCall(int,
+     * DataProfile, boolean, boolean, int, LinkProperties, int, NetworkSliceInfo, TrafficDescriptor,
+     * boolean, Message)} on target transport to initiate the handover process.
+     *
      * @param targetTransport The target transport.
      * @param retryEntry Data handover retry entry. This would be {@code null} for first time
      * handover attempt.
@@ -3018,12 +3073,16 @@ public class DataNetwork extends StateMachine {
             if (retryEntry != null) retryEntry.setState(DataRetryEntry.RETRY_STATE_CANCELLED);
             return false;
         }
-        sendMessage(obtainMessage(EVENT_START_HANDOVER, targetTransport, 0, retryEntry));
+
+        // Before we really initiate the handover process on target transport, we need to notify
+        // source transport that handover is about to start. Handover will be eventually initiated
+        // in onStartHandover().
+        sendMessage(obtainMessage(EVENT_NOTIFY_HANDOVER_STARTED, 0, targetTransport, retryEntry));
         return true;
     }
 
     /**
-     * Called when handover between IWLAN and cellular is needed.
+     * Called when starting IWLAN/cellular handover process on the target transport.
      *
      * @param targetTransport The target transport.
      * @param retryEntry Data handover retry entry. This would be {@code null} for first time
@@ -3078,7 +3137,6 @@ public class DataNetwork extends StateMachine {
                 DataService.REQUEST_REASON_HANDOVER, mLinkProperties, mPduSessionId,
                 mNetworkSliceInfo, mHandoverDataProfile.getTrafficDescriptor(), true,
                 obtainMessage(EVENT_HANDOVER_RESPONSE, retryEntry));
-        transitionTo(mHandoverState);
     }
 
     /**
@@ -3111,8 +3169,6 @@ public class DataNetwork extends StateMachine {
             mDataProfile = mHandoverDataProfile;
             updateDataNetwork(response);
             if (mTransport != AccessNetworkConstants.TRANSPORT_TYPE_WWAN) {
-                // Handover from WWAN to WLAN
-                mPcoData.clear();
                 unregisterForWwanEvents();
             } else {
                 // Handover from WLAN to WWAN
@@ -3123,6 +3179,12 @@ public class DataNetwork extends StateMachine {
                     () -> mDataNetworkCallback.onHandoverSucceeded(DataNetwork.this));
         } else {
             // Handover failed.
+
+            // Notify source transport that handover failed on target transport so that PDU session
+            // id can be released if it is preserved for handover.
+            mDataServiceManagers.get(mTransport).cancelHandover(mCid.get(mTransport),
+                    obtainMessage(EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE));
+
             long retry = response != null ? response.getRetryDurationMillis()
                     : DataCallResponse.RETRY_DURATION_UNDEFINED;
             int handoverFailureMode = response != null ? response.getHandoverFailureMode()
@@ -3141,34 +3203,53 @@ public class DataNetwork extends StateMachine {
     /**
      * Called when receiving PCO (Protocol Configuration Options) data from the cellular network.
      *
-     * @param pcoData PCO data.
+     * @param pcoData The PCO data.
      */
-    private void onPcoDataReceived(@NonNull PcoData pcoData) {
-        if (pcoData.cid != getId()) return;
-        PcoData oldData = mPcoData.put(pcoData.pcoId, pcoData);
-        if (!Objects.equals(oldData, pcoData)) {
-            log("onPcoDataReceived: " + pcoData);
-            mDataNetworkCallback.invokeFromExecutor(
-                    () -> mDataNetworkCallback.onPcoDataChanged(DataNetwork.this));
-            if (mDataProfile.getApnSetting() != null) {
-                for (int apnType : mDataProfile.getApnSetting().getApnTypes()) {
-                    Intent intent = new Intent(TelephonyManager.ACTION_CARRIER_SIGNAL_PCO_VALUE);
-                    intent.putExtra(TelephonyManager.EXTRA_APN_TYPE, apnType);
-                    intent.putExtra(TelephonyManager.EXTRA_APN_PROTOCOL,
-                            ApnSetting.getProtocolIntFromString(pcoData.bearerProto));
-                    intent.putExtra(TelephonyManager.EXTRA_PCO_ID, pcoData.pcoId);
-                    intent.putExtra(TelephonyManager.EXTRA_PCO_VALUE, pcoData.contents);
-                    mPhone.getCarrierSignalAgent().notifyCarrierSignalReceivers(intent);
-                }
+    private void onPcoDataChanged(@NonNull PcoData pcoData) {
+        log("onPcoDataChanged: " + pcoData);
+        mDataNetworkCallback.invokeFromExecutor(
+                () -> mDataNetworkCallback.onPcoDataChanged(DataNetwork.this));
+        if (mDataProfile.getApnSetting() != null) {
+            for (int apnType : mDataProfile.getApnSetting().getApnTypes()) {
+                Intent intent = new Intent(TelephonyManager.ACTION_CARRIER_SIGNAL_PCO_VALUE);
+                intent.putExtra(TelephonyManager.EXTRA_APN_TYPE, apnType);
+                intent.putExtra(TelephonyManager.EXTRA_APN_PROTOCOL,
+                        ApnSetting.getProtocolIntFromString(pcoData.bearerProto));
+                intent.putExtra(TelephonyManager.EXTRA_PCO_ID, pcoData.pcoId);
+                intent.putExtra(TelephonyManager.EXTRA_PCO_VALUE, pcoData.contents);
+                mPhone.getCarrierSignalAgent().notifyCarrierSignalReceivers(intent);
             }
         }
     }
 
     /**
-     * @return The PCO data received from the network.
+     * Called when receiving PCO (Protocol Configuration Options) data from the cellular network.
+     *
+     * @param pcoData PCO data.
+     */
+    private void onPcoDataReceived(@NonNull PcoData pcoData) {
+        // Save all the PCO data received, even though it might be unrelated to this data network.
+        // The network might be still in connecting state. Save all now and use it when entering
+        // connected state.
+        log("onPcoDataReceived: " + pcoData);
+        PcoData oldData = mPcoData.computeIfAbsent(pcoData.cid, m -> new ArrayMap<>())
+                .put(pcoData.pcoId, pcoData);
+        if (getId() == INVALID_CID || pcoData.cid != getId()) return;
+        if (!Objects.equals(oldData, pcoData)) {
+            onPcoDataChanged(pcoData);
+        }
+    }
+
+    /**
+     * @return The PCO data map of the network. The key is the PCO id, the value is the PCO data.
+     * An empty map if PCO data is not available (or when the network is on IWLAN).
      */
     public @NonNull Map<Integer, PcoData> getPcoData() {
-        return mPcoData;
+        if (mTransport == AccessNetworkConstants.TRANSPORT_TYPE_WLAN
+                || mCid.get(mTransport) == INVALID_CID) {
+            return Collections.emptyMap();
+        }
+        return mPcoData.getOrDefault(mCid.get(mTransport), Collections.emptyMap());
     }
 
     /**
@@ -3286,8 +3367,6 @@ public class DataNetwork extends StateMachine {
                 return "EVENT_BANDWIDTH_ESTIMATE_FROM_MODEM_CHANGED";
             case EVENT_DISPLAY_INFO_CHANGED:
                 return "EVENT_DISPLAY_INFO_CHANGED";
-            case EVENT_START_HANDOVER:
-                return "EVENT_START_HANDOVER";
             case EVENT_HANDOVER_RESPONSE:
                 return "EVENT_HANDOVER_RESPONSE";
             case EVENT_SUBSCRIPTION_PLAN_OVERRIDE:
@@ -3308,6 +3387,12 @@ public class DataNetwork extends StateMachine {
                 return "EVENT_VOICE_CALL_ENDED";
             case EVENT_CSS_INDICATOR_CHANGED:
                 return "EVENT_CSS_INDICATOR_CHANGED";
+            case EVENT_NOTIFY_HANDOVER_STARTED:
+                return "EVENT_NOTIFY_HANDOVER_STARTED";
+            case EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE:
+                return "EVENT_NOTIFY_HANDOVER_STARTED_RESPONSE";
+            case EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE:
+                return "EVENT_NOTIFY_HANDOVER_CANCELLED_RESPONSE";
             default:
                 return "Unknown(" + event + ")";
         }
