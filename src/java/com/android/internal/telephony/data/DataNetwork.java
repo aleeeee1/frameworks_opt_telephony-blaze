@@ -3272,28 +3272,6 @@ public class DataNetwork extends StateMachine {
         }
     }
 
-    /**
-     * Called when receiving PCO (Protocol Configuration Options) data from the cellular network.
-     *
-     * @param pcoData The PCO data.
-     */
-    private void onPcoDataChanged(@NonNull PcoData pcoData) {
-        log("onPcoDataChanged: " + pcoData);
-        mDataNetworkCallback.invokeFromExecutor(
-                () -> mDataNetworkCallback.onPcoDataChanged(DataNetwork.this));
-        if (mDataProfile.getApnSetting() != null) {
-            for (int apnType : mDataProfile.getApnSetting().getApnTypes()) {
-                Intent intent = new Intent(TelephonyManager.ACTION_CARRIER_SIGNAL_PCO_VALUE);
-                intent.putExtra(TelephonyManager.EXTRA_APN_TYPE, apnType);
-                intent.putExtra(TelephonyManager.EXTRA_APN_PROTOCOL,
-                        ApnSetting.getProtocolIntFromString(pcoData.bearerProto));
-                intent.putExtra(TelephonyManager.EXTRA_PCO_ID, pcoData.pcoId);
-                intent.putExtra(TelephonyManager.EXTRA_PCO_VALUE, pcoData.contents);
-                mPhone.getCarrierSignalAgent().notifyCarrierSignalReceivers(intent);
-            }
-	}
-    }
-
     private void onPcoDataReceived(@NonNull PcoData pcoData) {
         // Save all the PCO data received, even though it might be unrelated to this data network.
         // The network might be still in connecting state. Save all now and use it when entering
